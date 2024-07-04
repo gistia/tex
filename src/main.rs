@@ -1,7 +1,24 @@
 use aws_config::meta::region::RegionProviderChain;
 use aws_config::Region;
-use aws_sdk_textract::types::{Block, BlockType, Document, EntityType, RelationshipType, S3Object};
+use aws_sdk_textract::types::{Block, BlockType, Document, EntityType, RelationshipType};
 use aws_sdk_textract::Client;
+use std::collections::HashMap;
+
+#[derive(Debug)]
+struct KeyValuePair {
+    key: String,
+    value: String,
+    key_bounding_box: Option<BoundingBox>,
+    value_bounding_box: Option<BoundingBox>,
+}
+
+#[derive(Debug, Clone)]
+struct BoundingBox {
+    width: f32,
+    height: f32,
+    left: f32,
+    top: f32,
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -9,7 +26,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let region_provider = RegionProviderChain::default_provider().or_else(Region::new("us-east-1"));
 
     // Load configuration
-    #[allow(deprecated)]
     let config = aws_config::from_env().region(region_provider).load().await;
 
     // Create a Textract client
@@ -22,7 +38,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create the Document object
     let document = Document::builder()
         .s3_object(
-            S3Object::builder()
+            aws_sdk_textract::types::S3Object::builder()
                 .bucket(bucket)
                 .name(document_name)
                 .build(),
@@ -39,50 +55,102 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Process the results
     let blocks = resp.blocks();
-    for block in blocks {
-        match block.block_type().unwrap() {
-            BlockType::KeyValueSet => {
-                // Process key-value pairs (form fields)
-                if block.entity_types().contains(&EntityType::Key) {
-                    let key = block.text().unwrap_or("Unknown");
-                    let value = find_value_block(blocks, block).unwrap_or("N/A");
-                    println!("Field: {}, Value: {}", key, value);
-                }
-            }
-            BlockType::Word => {
-                // Process individual words and their bounding boxes
-                if let Some(geometry) = block.geometry() {
-                    if let Some(bounding_box) = geometry.bounding_box() {
-                        println!(
-                            "Word: {}, Bounding Box: {:?}",
-                            block.text().unwrap_or("Unknown"),
-                            bounding_box
-                        );
-                    }
-                }
-            }
-            _ => {}
-        }
+    let key_value_pairs = extract_key_value_pairs(blocks);
+
+    // Print the extracted key-value pairs
+    for pair in key_value_pairs {
+        println!("Key: {}", pair.key);
+        println!("Value: {}", pair.value);
+        println!("Key Bounding Box: {:?}", pair.key_bounding_box);
+        println!("Value Bounding Box: {:?}", pair.value_bounding_box);
+        println!("---");
     }
 
     Ok(())
 }
 
-// Helper function to find the value block for a given key block
-fn find_value_block<'a>(blocks: &'a [Block], key_block: &Block) -> Option<&'a str> {
-    let value_ids = key_block
-        .relationships()
-        .iter()
-        .find(|rel| rel.r#type() == Some(&RelationshipType::Value))
-        .and_then(|rel| Some(rel.ids()));
+fn extract_key_value_pairs(blocks: &[Block]) -> Vec<KeyValuePair> {
+    let mut key_map = HashMap::new();
+    let mut value_map = HashMap::new();
+    let mut block_map = HashMap::new();
 
-    if let Some(ids) = value_ids {
-        for id in ids {
-            if let Some(block) = blocks.iter().find(|b| b.id() == Some(id)) {
-                return block.text();
+    for block in blocks {
+        if let Some(block_id) = block.id() {
+            block_map.insert(block_id.to_string(), block);
+
+            if block.block_type() == Some(&BlockType::KeyValueSet) {
+                if block.entity_types().contains(&EntityType::Key) {
+                    key_map.insert(block_id.to_string(), block);
+                } else {
+                    value_map.insert(block_id.to_string(), block);
+                }
             }
         }
     }
 
-    None
+    let mut key_value_pairs = Vec::new();
+
+    for (_, key_block) in key_map {
+        let key_text = get_text_for_block(key_block, &block_map);
+        let key_bounding_box = key_block
+            .geometry()
+            .and_then(|g| g.bounding_box())
+            .map(|bb| BoundingBox {
+                width: bb.width(),
+                height: bb.height(),
+                left: bb.left(),
+                top: bb.top(),
+            });
+
+        let relationships = key_block.relationships();
+        for relationship in relationships {
+            if relationship.r#type() == Some(&RelationshipType::Value) {
+                for value_block_id in relationship.ids() {
+                    if let Some(value_block) = value_map.get(value_block_id) {
+                        let value_text = get_text_for_block(value_block, &block_map);
+                        let value_bounding_box = value_block
+                            .geometry()
+                            .and_then(|g| g.bounding_box())
+                            .map(|bb| BoundingBox {
+                                width: bb.width(),
+                                height: bb.height(),
+                                left: bb.left(),
+                                top: bb.top(),
+                            });
+
+                        key_value_pairs.push(KeyValuePair {
+                            key: key_text.clone(),
+                            value: value_text,
+                            key_bounding_box: key_bounding_box.clone(),
+                            value_bounding_box,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    key_value_pairs
+}
+
+fn get_text_for_block(block: &Block, block_map: &HashMap<String, &Block>) -> String {
+    let mut text = String::new();
+
+    let relationships = block.relationships();
+    for relationship in relationships {
+        if relationship.r#type() == Some(&RelationshipType::Child) {
+            for child_id in relationship.ids() {
+                if let Some(word_block) = block_map.get(child_id) {
+                    if word_block.block_type() == Some(&BlockType::Word) {
+                        if let Some(word_text) = word_block.text() {
+                            text.push_str(word_text);
+                            text.push(' ');
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    text.trim().to_string()
 }
