@@ -2,8 +2,12 @@ use aws_config::meta::region::RegionProviderChain;
 use aws_config::Region;
 use aws_sdk_textract::types::{Block, BlockType, Document, EntityType, RelationshipType};
 use aws_sdk_textract::Client;
+use axum::extract::{Path, State};
+use axum::routing::get;
+use axum::{Json, Router};
 use serde::Serialize;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 #[derive(Debug, Serialize)]
 struct KeyValuePair {
@@ -21,8 +25,12 @@ struct BoundingBox {
     top: f32,
 }
 
+struct AppState {
+    textract_client: Client,
+}
+
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> anyhow::Result<()> {
     // Set up the AWS region
     let region_provider = RegionProviderChain::default_provider().or_else(Region::new("us-east-1"));
 
@@ -31,29 +39,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = aws_config::from_env().region(region_provider).load().await;
 
     // Create a Textract client
-    let client = Client::new(&config);
+    let textract_client = Client::new(&config);
 
+    // Create app state
+    let app_state = Arc::new(AppState { textract_client });
+    //
+    // Build our application with a route
+    let app = Router::new()
+        .route("/analyze/:image_name", get(analyze_image))
+        .with_state(app_state);
+
+    // Run our application
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 3000));
+    println!("Listening on {}", addr);
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    axum::serve(listener, app).await?;
+
+    Ok(())
+}
+
+async fn analyze_image(
+    Path(image_name): Path<String>,
+    State(state): State<Arc<AppState>>,
+) -> Json<Vec<KeyValuePair>> {
     // Specify the S3 bucket and document
     let bucket = "smartflow-dev";
-    let document_name = "surgical-form-felipe.jpg";
 
     // Create the Document object
     let document = Document::builder()
         .s3_object(
             aws_sdk_textract::types::S3Object::builder()
                 .bucket(bucket)
-                .name(document_name)
+                .name(&image_name)
                 .build(),
         )
         .build();
 
     // Call Textract to analyze the document
-    let resp = client
+    let resp = state
+        .textract_client
         .analyze_document()
         .feature_types("FORMS".into())
         .document(document)
         .send()
-        .await?;
+        .await
+        .unwrap();
 
     // Process the results
     let blocks = resp.blocks();
@@ -62,9 +92,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Sort the key_value_pairs
     sort_key_value_pairs(&mut key_value_pairs);
 
-    serde_json::to_writer_pretty(std::io::stdout(), &key_value_pairs)?;
-
-    Ok(())
+    Json(key_value_pairs)
 }
 
 fn extract_key_value_pairs(blocks: &[Block]) -> Vec<KeyValuePair> {
