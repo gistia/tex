@@ -1096,6 +1096,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_json"
+version = "1.0.120"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4e0d21c9a8cae1235ad58a00c11cb40d4b1e5c784f1ef2c537876ed6ffd8b7c5"
+dependencies = [
+ "itoa",
+ "ryu",
+ "serde",
+]
+
+[[package]]
 name = "sha2"
 version = "0.10.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1169,6 +1180,8 @@ version = "0.1.0"
 dependencies = [
  "aws-config",
  "aws-sdk-textract",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 

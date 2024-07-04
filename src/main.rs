@@ -2,9 +2,10 @@ use aws_config::meta::region::RegionProviderChain;
 use aws_config::Region;
 use aws_sdk_textract::types::{Block, BlockType, Document, EntityType, RelationshipType};
 use aws_sdk_textract::Client;
+use serde::Serialize;
 use std::collections::HashMap;
 
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 struct KeyValuePair {
     key: String,
     value: String,
@@ -12,7 +13,7 @@ struct KeyValuePair {
     value_bounding_box: Option<BoundingBox>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 struct BoundingBox {
     width: f32,
     height: f32,
@@ -26,6 +27,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let region_provider = RegionProviderChain::default_provider().or_else(Region::new("us-east-1"));
 
     // Load configuration
+    #[allow(deprecated)]
     let config = aws_config::from_env().region(region_provider).load().await;
 
     // Create a Textract client
@@ -55,16 +57,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Process the results
     let blocks = resp.blocks();
-    let key_value_pairs = extract_key_value_pairs(blocks);
+    let mut key_value_pairs = extract_key_value_pairs(blocks);
 
-    // Print the extracted key-value pairs
-    for pair in key_value_pairs {
-        println!("Key: {}", pair.key);
-        println!("Value: {}", pair.value);
-        println!("Key Bounding Box: {:?}", pair.key_bounding_box);
-        println!("Value Bounding Box: {:?}", pair.value_bounding_box);
-        println!("---");
-    }
+    // Sort the key_value_pairs
+    sort_key_value_pairs(&mut key_value_pairs);
+
+    serde_json::to_writer_pretty(std::io::stdout(), &key_value_pairs)?;
 
     Ok(())
 }
@@ -153,4 +151,32 @@ fn get_text_for_block(block: &Block, block_map: &HashMap<String, &Block>) -> Str
     }
 
     text.trim().to_string()
+}
+
+fn sort_key_value_pairs(key_value_pairs: &mut Vec<KeyValuePair>) {
+    key_value_pairs.sort_by(|a, b| {
+        let a_box = a
+            .key_bounding_box
+            .as_ref()
+            .or(a.value_bounding_box.as_ref());
+        let b_box = b
+            .key_bounding_box
+            .as_ref()
+            .or(b.value_bounding_box.as_ref());
+
+        match (a_box, b_box) {
+            (Some(a), Some(b)) => a
+                .top
+                .partial_cmp(&b.top)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| {
+                    a.left
+                        .partial_cmp(&b.left)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                }),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        }
+    });
 }
