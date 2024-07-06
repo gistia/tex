@@ -1,12 +1,19 @@
 use aws_config::meta::region::RegionProviderChain;
 use aws_config::Region;
+use aws_sdk_s3::Client as S3Client;
 use aws_sdk_textract::types::{Block, BlockType, Document, EntityType, RelationshipType};
-use aws_sdk_textract::Client;
+use aws_sdk_textract::Client as TextractClient;
 use axum::extract::{Path, State};
+use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router};
+use image::{ImageBuffer, Rgb};
+use imageproc::drawing::{draw_hollow_rect_mut, draw_text_mut};
+use imageproc::rect::Rect;
+use rusttype::{Font, Scale};
 use serde::Serialize;
 use std::collections::HashMap;
+use std::io::Cursor;
 use std::sync::Arc;
 
 #[derive(Debug, Serialize)]
@@ -26,7 +33,8 @@ struct BoundingBox {
 }
 
 struct AppState {
-    textract_client: Client,
+    textract_client: TextractClient,
+    s3_client: S3Client,
 }
 
 #[tokio::main]
@@ -39,23 +47,135 @@ async fn main() -> anyhow::Result<()> {
     let config = aws_config::from_env().region(region_provider).load().await;
 
     // Create a Textract client
-    let textract_client = Client::new(&config);
+    let textract_client = TextractClient::new(&config);
+    let s3_client = S3Client::new(&config);
 
     // Create app state
-    let app_state = Arc::new(AppState { textract_client });
-    //
+    let app_state = Arc::new(AppState {
+        textract_client,
+        s3_client,
+    });
+
     // Build our application with a route
     let app = Router::new()
         .route("/analyze/:image_name", get(analyze_image))
+        .route("/display/:image_name", get(display_image))
         .with_state(app_state);
 
     // Run our application
-    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 3000));
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 3001));
     println!("Listening on {}", addr);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(listener, app).await?;
 
     Ok(())
+}
+
+async fn display_image(
+    Path(image_name): Path<String>,
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    let bucket = "smartflow-dev";
+
+    // Fetch image from S3
+    let get_object_output = state
+        .s3_client
+        .get_object()
+        .bucket(bucket)
+        .key(&image_name)
+        .send()
+        .await
+        .unwrap();
+
+    let image_data = get_object_output.body.collect().await.unwrap().into_bytes();
+    let mut img = image::load_from_memory(&image_data).unwrap().to_rgb8();
+
+    // Analyze the document with Textract
+    let document = Document::builder()
+        .s3_object(
+            aws_sdk_textract::types::S3Object::builder()
+                .bucket(bucket)
+                .name(&image_name)
+                .build(),
+        )
+        .build();
+
+    let resp = state
+        .textract_client
+        .analyze_document()
+        .feature_types("FORMS".into())
+        .document(document)
+        .send()
+        .await
+        .unwrap();
+
+    let blocks = resp.blocks();
+    let key_value_pairs = extract_key_value_pairs(blocks);
+
+    // Draw bounding boxes
+    let font = Vec::from(include_bytes!("roboto.ttf") as &[u8]);
+    let font = Font::try_from_vec(font).unwrap();
+
+    for pair in key_value_pairs {
+        if let Some(key_box) = pair.key_bounding_box {
+            draw_bounding_box(&mut img, &key_box, Rgb([0, 0, 255]), 3); // Blue for keys
+            draw_text(&mut img, &pair.key, &key_box, Rgb([0, 0, 0]), &font);
+        }
+        if let Some(value_box) = pair.value_bounding_box {
+            draw_bounding_box(&mut img, &value_box, Rgb([255, 0, 0]), 3); // Red for values
+            draw_text(&mut img, &pair.value, &value_box, Rgb([255, 0, 0]), &font);
+        }
+    }
+
+    // Convert image to bytes
+    let mut buffer = Cursor::new(Vec::new());
+    img.write_to(&mut buffer, image::ImageOutputFormat::Png)
+        .unwrap();
+
+    // Return the image
+    (
+        [(axum::http::header::CONTENT_TYPE, "image/png")],
+        buffer.into_inner(),
+    )
+}
+
+fn draw_bounding_box(
+    img: &mut ImageBuffer<Rgb<u8>, Vec<u8>>,
+    bbox: &BoundingBox,
+    color: Rgb<u8>,
+    thickness: u8,
+) {
+    let base_rect = Rect::at(
+        (bbox.left * img.width() as f32) as i32,
+        (bbox.top * img.height() as f32) as i32,
+    )
+    .of_size(
+        (bbox.width * img.width() as f32) as u32,
+        (bbox.height * img.height() as f32) as u32,
+    );
+
+    // Draw multiple rectangles to create a thicker border
+    for i in 0..thickness {
+        let offset = i as i32;
+        let expanded_rect = Rect::at(base_rect.left() - offset, base_rect.top() - offset).of_size(
+            base_rect.width() + 2 * offset as u32,
+            base_rect.height() + 2 * offset as u32,
+        );
+        draw_hollow_rect_mut(img, expanded_rect, color);
+    }
+}
+
+fn draw_text(
+    img: &mut ImageBuffer<Rgb<u8>, Vec<u8>>,
+    text: &str,
+    bbox: &BoundingBox,
+    color: Rgb<u8>,
+    font: &Font,
+) {
+    let scale = Scale::uniform(12.0);
+    let x = (bbox.left * img.width() as f32) as i32;
+    let y = (bbox.top * img.height() as f32) as i32;
+    draw_text_mut(img, color, x, y, scale, font, text);
 }
 
 async fn analyze_image(
